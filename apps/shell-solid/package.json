@@ -1,0 +1,24 @@
+{
+	"name": "@zomme/shell-solid",
+	"version": "1.0.0",
+	"type": "module",
+	"private": true,
+	"scripts": {
+		"build": "vite build",
+		"dev": "vite",
+		"lint": "bun run lint:format && bun run lint:types",
+		"lint:format": "bun biome check --write",
+		"lint:types": "bun tsc --noEmit",
+		"preview": "vite preview"
+	},
+	"dependencies": {
+		"@zomme/frame": "workspace:*",
+		"@zomme/frame-solid": "workspace:*",
+		"solid-js": "^1.9.11"
+	},
+	"devDependencies": {
+		"typescript": "~5.5.0",
+		"vite": "^5.4.11",
+		"vite-plugin-solid": "^2.11.0"
+	}
+}

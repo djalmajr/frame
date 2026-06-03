@@ -7,10 +7,18 @@ const PACKAGES = [
   "packages/frame",
   "packages/frame-angular",
   "packages/frame-react",
+  "packages/frame-solid",
   "packages/frame-vue",
 ];
 
-const APPS = ["apps/shell-angular", "apps/app-angular", "apps/app-react", "apps/app-vue"];
+const APPS = [
+  "apps/shell-angular",
+  "apps/app-angular",
+  "apps/app-react",
+  "apps/app-vue",
+  "apps/shell-solid",
+  "apps/app-excalidraw",
+];
 
 interface BuildOptions {
   watch: boolean;

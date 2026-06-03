@@ -1,0 +1,26 @@
+{
+	"name": "@zomme/frame-solid",
+	"version": "1.0.0",
+	"license": "MIT",
+	"type": "module",
+	"main": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"exports": {
+		".": "./dist/index.js"
+	},
+	"scripts": {
+		"build": "bun build src/index.ts --outdir dist --target browser --format esm --external solid-js --external 'solid-js/*' --external '@zomme/frame' --external '@zomme/frame/*' && tsc --emitDeclarationOnly",
+		"dev": "bun build src/index.ts --outdir dist --target browser --format esm --external solid-js --external 'solid-js/*' --external '@zomme/frame' --external '@zomme/frame/*' --watch",
+		"lint:format": "bun biome check --write",
+		"lint:types": "bun tsc --noEmit",
+		"lint": "bun run lint:format && bun run lint:types"
+	},
+	"peerDependencies": {
+		"@zomme/frame": "workspace:*",
+		"solid-js": "^1.9.0"
+	},
+	"devDependencies": {
+		"solid-js": "^1.9.11",
+		"typescript": "^5.3.3"
+	}
+}

@@ -1,0 +1,27 @@
+{
+	"name": "@zomme/app-excalidraw",
+	"version": "1.0.0",
+	"type": "module",
+	"private": true,
+	"scripts": {
+		"build": "vite build",
+		"dev": "vite",
+		"lint": "bun run lint:format && bun run lint:types",
+		"lint:format": "bun biome check --write",
+		"lint:types": "bun tsc --noEmit",
+		"preview": "vite preview"
+	},
+	"dependencies": {
+		"@excalidraw/excalidraw": "^0.17.6",
+		"@zomme/frame-react": "workspace:*",
+		"react": "^18.3.1",
+		"react-dom": "^18.3.1"
+	},
+	"devDependencies": {
+		"@types/react": "^18.3.18",
+		"@types/react-dom": "^18.3.5",
+		"@vitejs/plugin-react": "^4.3.4",
+		"typescript": "~5.5.0",
+		"vite": "^5.4.11"
+	}
+}

@@ -1,0 +1,51 @@
+= @zomme/frame-solid
+
+SolidJS bindings for `@zomme/frame` — drive the `<z-frame>` host element and the
+guest `frameSDK` with Solid primitives.
+
+== Host — `Frame`
+
+[source,tsx]
+----
+import { Frame } from "@zomme/frame-solid";
+
+<Frame
+  name="excalidraw"
+  src="/excalidraw/index.html"
+  class="size-full"
+  drawingData={scene()}        // data + non-`on` functions → guest props (RPC)
+  save={persistScene}          // guest calls: await frameSDK.props.save(data)
+  onSaved={(e) => toast("ok")} // `on<Event>` → addEventListener("saved")
+  onError={(e) => report(e)}
+/>
+----
+
+Prop rules (same as `@zomme/frame-react`):
+
+* `name` / `src` / `sandbox` / `base` / `pathname` / `class` / `id` / `style` — host attributes.
+* `on<Event>` functions → `addEventListener("<event>")` (events the guest emits via `frameSDK.emit`).
+* every other value (objects **and** plain functions) → DOM property, forwarded to the guest.
+
+IMPORTANT: name guest callbacks **without** the `on` prefix (`save`, not `onSave`),
+otherwise they are treated as event listeners instead of RPC props.
+
+== Guest — `createFrameSDK`
+
+[source,tsx]
+----
+import { createFrameSDK } from "@zomme/frame-solid";
+
+const frame = createFrameSDK<{ drawingData?: Scene; save?: (s: Scene) => Promise<void> }>();
+
+frame.props.drawingData;                       // reactive store, synced from host
+frame.watchProps(["drawingData"], (c) => …);   // react to host updates
+await frame.props.save?.(scene);               // RPC call into the host
+frame.register({ getScene, exportSvg });       // expose functions to the host
+frame.emit("saved", { at: Date.now() });       // notify the host
+----
+
+== Notes
+
+* The host `Frame` is authored without JSX (imperative DOM + Solid primitives),
+  so the package builds with a plain `bun build` — no Solid JSX transform needed.
+* `solid-js` and `@zomme/frame` are peer dependencies.
