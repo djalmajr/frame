@@ -1,0 +1,19 @@
+{
+	"extends": "../../tsconfig.base.json",
+	"compilerOptions": {
+		"outDir": "./dist",
+		"rootDir": "./src",
+		"jsx": "preserve",
+		"jsxImportSource": "solid-js",
+		"declaration": true,
+		"declarationMap": true,
+		"emitDeclarationOnly": true,
+		"paths": {
+			"@zomme/frame": ["../frame/dist/frame.d.ts"],
+			"@zomme/frame/sdk": ["../frame/dist/sdk.d.ts"],
+			"@zomme/frame/types": ["../frame/dist/types.d.ts"]
+		}
+	},
+	"include": ["src/**/*"],
+	"exclude": ["node_modules", "dist", "**/*.test.ts", "**/*.test.tsx"]
+}

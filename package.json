@@ -7,6 +7,9 @@
 		"packages/*",
 		"apps/*"
 	],
+	"overrides": {
+		"yallist": "3.1.1"
+	},
 	"scripts": {
 		"build": "bun scripts/build.ts",
 		"dev": "bun scripts/build.ts --watch",
