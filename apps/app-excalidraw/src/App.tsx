@@ -18,29 +18,58 @@ interface ExcalidrawFrameProps {
  * Guest: a full, editable Excalidraw editor (no preview, no edit/preview toggle)
  * wired to the host through the Frame SDK.
  *
- * - load:  `props.drawingData` → Excalidraw `initialData` (and `updateScene` on change);
- * - save:  debounced `onChange` → `await props.save(scene)` (RPC into the host);
- * - host→editor: `getScene` registered for the host to pull the current scene;
- * - status: `emit("dirty"|"saved"|"error", …)`.
+ * Load: the host pushes `drawingData`. Excalidraw is heavy, so the push can land
+ * BEFORE the editor's `excalidrawAPI` is ready — in that case we stash it and
+ * apply it the moment the API arrives (the previous bug: the push was dropped
+ * because `apiRef` was still null and `drawingData` never changed again, so the
+ * file looked empty on reopen even though it was saved on disk).
+ *
+ * Save: the guest does NOT own persistence/debounce. On every (coalesced) change
+ * it pushes the current scene to the host via `props.save`; the host keeps the
+ * latest, debounces the disk write, and flushes on teardown — so a tab switch
+ * that unmounts this iframe never drops the latest edit.
  */
 export function App() {
-  const { props, emit, sdkAvailable, watchProps } = useFrameSDK<ExcalidrawFrameProps>();
+  const { props, sdkAvailable } = useFrameSDK<ExcalidrawFrameProps>();
   const apiRef = useRef<any>(null);
-  const saveTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const pendingScene = useRef<Scene | undefined>(props.drawingData);
+  const lastAppliedSig = useRef<string>("");
+  const sendTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const lastSig = useRef<string>("");
+  const propsRef = useRef(props);
+  propsRef.current = props;
 
-  // Apply a new scene if the host pushes one after mount.
-  useEffect(() => {
-    return watchProps(["drawingData"], (changes) => {
-      const next = changes.drawingData?.[0] as Scene | undefined;
-      if (next && apiRef.current) {
-        apiRef.current.updateScene({
-          appState: (next.appState ?? {}) as any,
-          elements: (next.elements ?? []) as any,
-        });
-      }
+  const applyScene = useCallback((scene: Scene | undefined) => {
+    const api = apiRef.current;
+    if (!api || !scene) return;
+    api.updateScene({
+      appState: (scene.appState ?? {}) as any,
+      elements: (scene.elements ?? []) as any,
     });
-  }, [watchProps]);
+  }, []);
+
+  const send = useCallback(() => {
+    const api = apiRef.current;
+    if (!api) return;
+    void propsRef.current.save?.({
+      appState: { viewBackgroundColor: api.getAppState?.()?.viewBackgroundColor },
+      elements: api.getSceneElements?.() ?? [],
+    });
+  }, []);
+
+  // Apply the scene the host pushes. `props` is reactive (useSyncExternalStore),
+  // so this fires whenever drawingData arrives — including the initial handshake
+  // delivery that `watchProps` (change-only) can miss. Stash it so a push that
+  // lands before the editor API is ready is still applied (see applyScene). Sig-
+  // gated so an unrelated prop re-render never re-applies and clobbers edits.
+  useEffect(() => {
+    const dd = props.drawingData;
+    const sig = dd ? JSON.stringify(dd.elements ?? []) : "";
+    if (!dd || sig === lastAppliedSig.current) return;
+    lastAppliedSig.current = sig;
+    pendingScene.current = dd;
+    applyScene(dd);
+  }, [props.drawingData, applyScene]);
 
   // Expose actions the host can call.
   useEffect(() => {
@@ -54,27 +83,16 @@ export function App() {
   }, [sdkAvailable]);
 
   const handleChange = useCallback(
-    (elements: readonly any[], appState: any) => {
-      // Ignore pure view changes (pan/zoom) — only persist element edits.
+    (elements: readonly any[]) => {
+      // Ignore pure view changes (pan/zoom) — only push on element edits.
       const sig = JSON.stringify(elements);
       if (sig === lastSig.current) return;
       lastSig.current = sig;
-
-      clearTimeout(saveTimer.current);
-      saveTimer.current = setTimeout(async () => {
-        emit("dirty", { count: elements.length });
-        try {
-          await props.save?.({
-            appState: { viewBackgroundColor: appState?.viewBackgroundColor },
-            elements,
-          });
-          emit("saved", { at: Date.now(), count: elements.length });
-        } catch (err) {
-          emit("error", { message: (err as Error)?.message ?? String(err) });
-        }
-      }, 500);
+      // Coalesce rapid strokes, then push the current scene to the host.
+      clearTimeout(sendTimer.current);
+      sendTimer.current = setTimeout(send, 80);
     },
-    [emit, props],
+    [send],
   );
 
   return (
@@ -82,6 +100,9 @@ export function App() {
       <Excalidraw
         excalidrawAPI={(api: any) => {
           apiRef.current = api;
+          // Apply whatever the host already pushed (or the initial prop) now that
+          // the editor API exists.
+          applyScene(pendingScene.current ?? propsRef.current.drawingData);
         }}
         initialData={
           props.drawingData
