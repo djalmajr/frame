@@ -821,6 +821,34 @@ export class Frame extends HTMLElement {
  * SET trap: Creates reactive getter/setter for dynamic properties
  *   - frame.myProp = value → syncs to iframe automatically
  */
+// Properties that must never be exposed as dynamic RPC methods, because the
+// host JS engine probes the element for them and would call the fabricated
+// function with the wrong `this` (the prototype, or a foreign receiver),
+// throwing "Illegal invocation" inside the `instance.src` error path.
+//
+// - Promise protocol (`then`/`catch`/`finally`): returning a function for `then`
+//   makes the element a "thenable", so the moment it flows through a Promise
+//   (`await frame`, `Promise.resolve(frame)`, or a reactive framework resolving
+//   it during render) the runtime calls `.then()`.
+// - Custom Element reaction callbacks: `customElements.define` reads these off
+//   the prototype to register reactions. The class implements some, but the
+//   proxy would fabricate a function for the ones it doesn't (notably
+//   `adoptedCallback`), so the browser registers and later invokes it.
+const RESERVED_DYNAMIC_PROPS = new Set([
+  "then",
+  "catch",
+  "finally",
+  "connectedCallback",
+  "disconnectedCallback",
+  "adoptedCallback",
+  "attributeChangedCallback",
+  "connectedMoveCallback",
+  "formAssociatedCallback",
+  "formDisabledCallback",
+  "formResetCallback",
+  "formStateRestoreCallback",
+]);
+
 const setupPrototypeProxy = () => {
   const proto = Frame.prototype;
   const protoOfProto = Object.getPrototypeOf(proto);
@@ -832,7 +860,11 @@ const setupPrototypeProxy = () => {
 
       // Dynamic method pattern for camelCase function calls
       // frame.refreshData() → calls registered function 'refreshData'
-      if (typeof prop === "string" && /^[a-z][a-zA-Z0-9]*$/.test(prop)) {
+      if (
+        typeof prop === "string" &&
+        /^[a-z][a-zA-Z0-9]*$/.test(prop) &&
+        !RESERVED_DYNAMIC_PROPS.has(prop)
+      ) {
         const instance = receiver as Frame;
 
         // Check if we have a cached method
@@ -868,6 +900,12 @@ const setupPrototypeProxy = () => {
 
       // Allow private properties
       if (prop.startsWith("_")) {
+        return Reflect.set(target, prop, value, receiver);
+      }
+
+      // Never turn the Promise protocol into a reactive prop — defining an own
+      // `then` would re-introduce the thenable trap the getter guards against.
+      if (RESERVED_DYNAMIC_PROPS.has(prop)) {
         return Reflect.set(target, prop, value, receiver);
       }
 
