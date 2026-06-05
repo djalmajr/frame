@@ -1,6 +1,6 @@
 {
 	"name": "@zomme/frame-react",
-	"version": "1.1.1",
+	"version": "1.1.2",
 	"license": "Apache-2.0",
 	"type": "module",
 	"main": "./dist/index.js",
@@ -8,6 +8,10 @@
 	"exports": {
 		".": "./dist/index.js"
 	},
+	"files": [
+		"dist",
+		"README.md"
+	],
 	"scripts": {
 		"build": "bun build src/index.ts --outdir dist --target browser --format esm --external react --external '@zomme/frame' --external '@zomme/frame/*' && tsc --emitDeclarationOnly",
 		"dev": "bun build src/index.ts --outdir dist --target browser --format esm --external react --external '@zomme/frame' --external '@zomme/frame/*' --watch",
@@ -16,7 +20,7 @@
 		"lint": "bun run lint:format && bun run lint:types"
 	},
 	"peerDependencies": {
-		"@zomme/frame": "workspace:*",
+		"@zomme/frame": "^1.2.3",
 		"react": "^18.0.0"
 	},
 	"devDependencies": {

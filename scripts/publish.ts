@@ -336,7 +336,10 @@ async function publishPackage(
     return true;
   }
 
-  const result = await runCommand(pkgPath, "npm", args);
+  // Use `bun publish` (not `npm publish`): bun rewrites the `workspace:*`
+  // protocol in dependencies to the real version at publish time. npm leaves
+  // `workspace:*` literal, which breaks every external consumer.
+  const result = await runCommand(pkgPath, "bun", args);
 
   if (!result.success) {
     console.error(`Publish failed for ${name}\n`);
