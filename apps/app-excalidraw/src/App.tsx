@@ -1,12 +1,52 @@
-import { Excalidraw } from "@excalidraw/excalidraw";
+import { convertToExcalidrawElements, Excalidraw, getCommonBounds } from "@excalidraw/excalidraw";
 // Excalidraw 0.18 no longer auto-injects its stylesheet — import it explicitly.
 import "@excalidraw/excalidraw/index.css";
+import { parseMermaidToExcalidraw } from "@excalidraw/mermaid-to-excalidraw";
 import { frameSDK, useFrameSDK } from "@zomme/frame-react";
 import { useCallback, useEffect, useRef } from "react";
 
 interface Scene {
   appState?: Record<string, unknown>;
   elements?: readonly unknown[];
+  /** Binary blobs backing image elements (Excalidraw's top-level `files` map),
+   *  keyed by fileId. Must round-trip or images reopen broken. */
+  files?: Record<string, unknown>;
+}
+
+/**
+ * Where a generated diagram lands relative to what's already on the canvas.
+ * MIRRORS the host's `ExcalidrawApplyMode` (apps/desktop/.../excalidraw-frame.tsx)
+ * — keep the two string unions in sync.
+ */
+type ApplyMode = "replace-selection" | "append" | "replace-all";
+
+interface ApplyMermaidInput {
+  /** Mermaid source (flowchart/sequence/class/ER — the only editable types). */
+  mermaid: string;
+  mode: ApplyMode;
+}
+
+interface ApplyMermaidResult {
+  ok: boolean;
+  /** The mode actually used (replace-selection silently degrades to append when
+   *  there is no selection, so the host/model learns what really happened). */
+  mode: ApplyMode;
+  added: number;
+  removed: number;
+  error?: string;
+}
+
+/** Gap (px) left between existing content and an appended diagram. */
+const APPEND_GAP = 80;
+
+type AnyElement = { id: string; x: number; y: number; [k: string]: unknown };
+
+/** Translate a fresh element group by (dx, dy). Arrow `points` are relative to
+ *  the element's x/y, so moving x/y moves the whole shape — including bound
+ *  text and arrow waypoints — keeping the group's internal layout intact. */
+function translate(elements: readonly AnyElement[], dx: number, dy: number): AnyElement[] {
+  if (dx === 0 && dy === 0) return elements as AnyElement[];
+  return elements.map((el) => ({ ...el, x: el.x + dx, y: el.y + dy }));
 }
 
 interface ExcalidrawFrameProps {
@@ -44,6 +84,11 @@ export function App() {
   const applyScene = useCallback((scene: Scene | undefined) => {
     const api = apiRef.current;
     if (!api || !scene) return;
+    // Register image blobs before the scene references them, or the image
+    // elements render broken (e.g. a pasted image, or a Mermaid image fallback).
+    if (scene.files && Object.keys(scene.files).length > 0) {
+      api.addFiles?.(Object.values(scene.files) as any);
+    }
     api.updateScene({
       appState: (scene.appState ?? {}) as any,
       elements: (scene.elements ?? []) as any,
@@ -56,8 +101,102 @@ export function App() {
     void propsRef.current.save?.({
       appState: { viewBackgroundColor: api.getAppState?.()?.viewBackgroundColor },
       elements: api.getSceneElements?.() ?? [],
+      // Persist image blobs alongside elements so images survive a reopen.
+      files: api.getFiles?.() ?? {},
     });
   }, []);
+
+  // Host-callable RPC: render a Mermaid diagram into THIS canvas. Conversion has
+  // to happen here, in the iframe — `parseMermaidToExcalidraw` drives mermaid's
+  // real renderer, which needs a DOM (the host's logic layer / Rust can't).
+  //
+  // `regenerateIds: true` gives every generated element a fresh random id (and
+  // rewrites bindings to match), so appending the SAME diagram twice can't
+  // collide with existing ids and silently merge instead of adding.
+  const applyMermaid = useCallback(
+    async ({ mermaid, mode }: ApplyMermaidInput): Promise<ApplyMermaidResult> => {
+      const api = apiRef.current;
+      if (!api) return { ok: false, mode, added: 0, removed: 0, error: "Editor not ready" };
+
+      let fresh: AnyElement[];
+      // `files` is populated when Mermaid falls back to an image (unsupported
+      // types like pie/gantt come in as one image element + its blob); we must
+      // register the blob or the image renders broken.
+      let files: Record<string, unknown> | undefined;
+      try {
+        const result = await parseMermaidToExcalidraw(mermaid);
+        files = result.files as Record<string, unknown> | undefined;
+        fresh = convertToExcalidrawElements(result.elements, {
+          regenerateIds: true,
+        }) as AnyElement[];
+      } catch (err) {
+        return {
+          ok: false,
+          mode,
+          added: 0,
+          removed: 0,
+          error: err instanceof Error ? err.message : String(err),
+        };
+      }
+      if (fresh.length === 0) {
+        return { ok: false, mode, added: 0, removed: 0, error: "Mermaid produced no shapes" };
+      }
+
+      const current = (api.getSceneElements?.() ?? []) as AnyElement[];
+      const selectedIds: Record<string, true> =
+        (api.getAppState?.()?.selectedElementIds as Record<string, true>) ?? {};
+
+      let effectiveMode = mode;
+      let placed: AnyElement[];
+      let base: AnyElement[];
+      let removed = 0;
+
+      if (mode === "replace-all") {
+        placed = fresh;
+        base = [];
+        removed = current.length;
+      } else if (mode === "replace-selection" && current.some((el) => selectedIds[el.id])) {
+        const selected = current.filter((el) => selectedIds[el.id]);
+        const [sMinX, sMinY] = getCommonBounds(selected as never);
+        const [nMinX, nMinY] = getCommonBounds(fresh as never);
+        placed = translate(fresh, sMinX - nMinX, sMinY - nMinY);
+        base = current.filter((el) => !selectedIds[el.id]);
+        removed = selected.length;
+      } else {
+        // append (and replace-selection with nothing selected → degrade to append).
+        effectiveMode = "append";
+        if (current.length === 0) {
+          placed = fresh;
+        } else {
+          const [cMinX, , , cMaxY] = getCommonBounds(current as never);
+          const [nMinX, nMinY] = getCommonBounds(fresh as never);
+          placed = translate(fresh, cMinX - nMinX, cMaxY + APPEND_GAP - nMinY);
+        }
+        base = current;
+      }
+
+      const nextElements = [...base, ...placed];
+      const selection: Record<string, true> = {};
+      for (const el of placed) selection[el.id] = true;
+
+      // Register image blobs (Mermaid fallback) before the scene references them.
+      if (files && Object.keys(files).length > 0) {
+        api.addFiles?.(Object.values(files) as never);
+      }
+      api.updateScene({
+        elements: nextElements as never,
+        appState: { selectedElementIds: selection } as never,
+      });
+      // Bring the new diagram into view without yanking the whole canvas around.
+      api.scrollToContent?.(placed as never, { fitToContent: true, animate: true });
+      // Persist immediately (don't wait on the coalesced onChange) so a quick
+      // tab switch right after generating can't drop it.
+      send();
+
+      return { ok: true, mode: effectiveMode, added: placed.length, removed };
+    },
+    [send],
+  );
 
   // Apply the scene the host pushes. `props` is reactive (useSyncExternalStore),
   // so this fires whenever drawingData arrives — including the initial handshake
@@ -81,8 +220,9 @@ export function App() {
         appState: apiRef.current?.getAppState?.() ?? {},
         elements: apiRef.current?.getSceneElements?.() ?? [],
       }),
+      applyMermaid,
     });
-  }, [sdkAvailable]);
+  }, [sdkAvailable, applyMermaid]);
 
   const handleChange = useCallback(
     (elements: readonly any[]) => {
@@ -111,6 +251,7 @@ export function App() {
             ? {
                 appState: (props.drawingData.appState ?? {}) as any,
                 elements: (props.drawingData.elements ?? []) as any,
+                files: (props.drawingData.files ?? {}) as any,
               }
             : undefined
         }
