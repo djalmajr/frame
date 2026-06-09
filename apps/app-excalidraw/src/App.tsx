@@ -1,4 +1,6 @@
 import { Excalidraw } from "@excalidraw/excalidraw";
+// Excalidraw 0.18 no longer auto-injects its stylesheet — import it explicitly.
+import "@excalidraw/excalidraw/index.css";
 import { frameSDK, useFrameSDK } from "@zomme/frame-react";
 import { useCallback, useEffect, useRef } from "react";
 
