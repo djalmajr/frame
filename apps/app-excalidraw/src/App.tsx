@@ -49,6 +49,115 @@ function translate(elements: readonly AnyElement[], dx: number, dy: number): Any
   return elements.map((el) => ({ ...el, x: el.x + dx, y: el.y + dy }));
 }
 
+interface Binding {
+  elementId: string;
+  focus?: number;
+  gap?: number;
+}
+
+/** Absolute coordinate of an arrow endpoint (start = first point, end = last).
+ *  Arrow `points` are relative to the element's x/y. */
+function endpoint(arrow: AnyElement, which: "start" | "end"): { x: number; y: number } {
+  const pts = (arrow.points as number[][] | undefined) ?? [[0, 0]];
+  const p = which === "start" ? pts[0] : pts[pts.length - 1];
+  return { x: arrow.x + (p?.[0] ?? 0), y: arrow.y + (p?.[1] ?? 0) };
+}
+
+/** Expand a raw Excalidraw selection into the full set of element ids to remove
+ *  on a replace-selection. Excalidraw's `selectedElementIds` usually holds only
+ *  the container shapes — NOT their bound text labels (which visually belong to
+ *  the shape) nor the connectors that live entirely inside the selection. Pull
+ *  those in so replacing a block removes the WHOLE block, never leaving an
+ *  orphaned label floating over the new content. */
+function expandSelection(current: readonly AnyElement[], selectedIds: Record<string, true>): Set<string> {
+  const sel = new Set(current.filter((el) => selectedIds[el.id]).map((el) => el.id));
+  // Arrows whose BOTH endpoints are selected are internal to the block.
+  for (const el of current) {
+    if (el.type !== "arrow" || sel.has(el.id)) continue;
+    const s = (el.startBinding as Binding | null | undefined)?.elementId;
+    const e = (el.endBinding as Binding | null | undefined)?.elementId;
+    if (s && e && sel.has(s) && sel.has(e)) sel.add(el.id);
+  }
+  // Text bound (containerId) to anything now in the set — i.e. shape AND arrow
+  // labels — moves/deletes with its owner.
+  for (const el of current) {
+    if (el.type !== "text" || sel.has(el.id)) continue;
+    const cid = el.containerId as string | null | undefined;
+    if (typeof cid === "string" && sel.has(cid)) sel.add(el.id);
+  }
+  return sel;
+}
+
+/** Re-stitch boundary arrows after a replace-selection. Arrows in `base` (the
+ *  kept elements) that were bound to a now-deleted element have a dangling
+ *  endpoint; re-bind each to the nearest shape of the freshly inserted block
+ *  (`placed`), so the new block stays wired into the surrounding diagram instead
+ *  of leaving floating arrows. Because `placed` is positioned at the old
+ *  selection's top-left, "nearest new shape to the old endpoint" reconnects the
+ *  flow sensibly. Returns new `base`/`placed` arrays (inputs are not mutated). */
+function restitchBoundary(
+  base: readonly AnyElement[],
+  placed: readonly AnyElement[],
+  deletedIds: Set<string>,
+): { base: AnyElement[]; placed: AnyElement[] } {
+  // Only shapes are bind targets — not labels (text) or other arrows.
+  const targets = placed.filter((el) => el.type !== "arrow" && el.type !== "text");
+  if (targets.length === 0) return { base: base as AnyElement[], placed: placed as AnyElement[] };
+
+  // Clone placed so we can append to `boundElements` without mutating inputs.
+  const placedClones = placed.map((el) => ({
+    ...el,
+    boundElements: Array.isArray(el.boundElements) ? [...(el.boundElements as unknown[])] : [],
+  }));
+  const cloneById = new Map(placedClones.map((el) => [el.id, el]));
+  const center = (el: AnyElement) => ({
+    x: el.x + ((el.width as number) ?? 0) / 2,
+    y: el.y + ((el.height as number) ?? 0) / 2,
+  });
+  const nearest = (x: number, y: number): AnyElement | null => {
+    let best: AnyElement | null = null;
+    let bestD = Infinity;
+    for (const t of targets) {
+      const c = center(t);
+      const d = (c.x - x) ** 2 + (c.y - y) ** 2;
+      if (d < bestD) {
+        bestD = d;
+        best = cloneById.get(t.id) ?? null;
+      }
+    }
+    return best;
+  };
+
+  const newBase = base.map((el) => {
+    if (el.type !== "arrow") return el;
+    const sb = el.startBinding as Binding | null | undefined;
+    const eb = el.endBinding as Binding | null | undefined;
+    const reSb = sb && deletedIds.has(sb.elementId);
+    const reEb = eb && deletedIds.has(eb.elementId);
+    if (!reSb && !reEb) return el;
+    const next: AnyElement = { ...el };
+    if (reSb) {
+      const ep = endpoint(el, "start");
+      const tgt = nearest(ep.x, ep.y);
+      if (tgt) {
+        next.startBinding = { ...sb, elementId: tgt.id, focus: 0 };
+        (tgt.boundElements as unknown[]).push({ id: el.id, type: "arrow" });
+      }
+    }
+    if (reEb) {
+      const ep = endpoint(el, "end");
+      const tgt = nearest(ep.x, ep.y);
+      if (tgt) {
+        next.endBinding = { ...eb, elementId: tgt.id, focus: 0 };
+        (tgt.boundElements as unknown[]).push({ id: el.id, type: "arrow" });
+      }
+    }
+    return next;
+  });
+
+  return { base: newBase, placed: placedClones };
+}
+
 interface ExcalidrawFrameProps {
   /** Initial scene pushed by the host (loaded once on mount, re-applied if it changes). */
   drawingData?: Scene;
@@ -156,12 +265,22 @@ export function App() {
         base = [];
         removed = current.length;
       } else if (mode === "replace-selection" && current.some((el) => selectedIds[el.id])) {
-        const selected = current.filter((el) => selectedIds[el.id]);
+        // Remove the WHOLE selected block — shapes + their bound labels + any
+        // connectors internal to it — not just the raw selectedElementIds.
+        const removeSet = expandSelection(current, selectedIds);
+        const selected = current.filter((el) => removeSet.has(el.id));
         const [sMinX, sMinY] = getCommonBounds(selected as never);
         const [nMinX, nMinY] = getCommonBounds(fresh as never);
         placed = translate(fresh, sMinX - nMinX, sMinY - nMinY);
-        base = current.filter((el) => !selectedIds[el.id]);
+        base = current.filter((el) => !removeSet.has(el.id));
         removed = selected.length;
+        // Re-wire arrows that connected the rest of the diagram to the replaced
+        // block: rebind their dangling endpoints to the nearest shape of the new
+        // block, so the expanded block stays stitched into the surrounding flow
+        // instead of leaving floating arrows.
+        const stitched = restitchBoundary(base, placed, removeSet);
+        base = stitched.base;
+        placed = stitched.placed;
       } else {
         // append (and replace-selection with nothing selected → degrade to append).
         effectiveMode = "append";
