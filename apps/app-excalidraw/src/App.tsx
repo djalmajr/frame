@@ -1,4 +1,4 @@
-import { convertToExcalidrawElements, Excalidraw, getCommonBounds } from "@excalidraw/excalidraw";
+import { convertToExcalidrawElements, Excalidraw, getCommonBounds, restoreElements } from "@excalidraw/excalidraw";
 // Excalidraw 0.18 no longer auto-injects its stylesheet — import it explicitly.
 import "@excalidraw/excalidraw/index.css";
 import { parseMermaidToExcalidraw } from "@excalidraw/mermaid-to-excalidraw";
@@ -200,7 +200,14 @@ export function App() {
     }
     api.updateScene({
       appState: (scene.appState ?? {}) as any,
-      elements: (scene.elements ?? []) as any,
+      // Run external elements through `restore` BEFORE applying. `updateScene`
+      // (unlike `initialData`) does NOT restore, so raw arrows carrying the
+      // `elbowed` flag without its companion fields (fixedSegments / startIsSpecial
+      // / endIsSpecial) make Excalidraw's arrow handling throw → the scene-apply
+      // aborts and the canvas renders blank. `restoreElements` reconciles them
+      // (and normalizes any other external scene). See djalmajr/asciimark
+      // diagnosis (2026-06-17).
+      elements: restoreElements((scene.elements ?? []) as any, null) as any,
     });
   }, []);
 
