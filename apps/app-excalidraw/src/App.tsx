@@ -187,6 +187,12 @@ export function App() {
   const lastAppliedSig = useRef<string>("");
   const sendTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const lastSig = useRef<string>("");
+  // Window during which onChange-driven saves are ignored, set right after a
+  // host-driven scene load. `restore`/`updateScene` mutate the elements (e.g.
+  // drop the redundant `elbowed` flag), firing onChange — but a LOAD is not a
+  // user edit, so writing it back would rewrite the file on every open and the
+  // watcher-reload that follows can blank the canvas.
+  const suppressSaveUntil = useRef(0);
   const propsRef = useRef(props);
   propsRef.current = props;
 
@@ -209,6 +215,10 @@ export function App() {
       // diagnosis (2026-06-17).
       elements: restoreElements((scene.elements ?? []) as any, null) as any,
     });
+    // Mark the onChange(s) this host load triggers as non-user so they are not
+    // written back to disk (see suppressSaveUntil). 600ms covers updateScene's
+    // async onChange + the host's debounced write.
+    suppressSaveUntil.current = Date.now() + 600;
   }, []);
 
   const send = useCallback(() => {
@@ -356,6 +366,10 @@ export function App() {
       const sig = JSON.stringify(elements);
       if (sig === lastSig.current) return;
       lastSig.current = sig;
+      // A host-driven scene load (applyScene) also fires onChange — that is not a
+      // user edit, so skip the disk write (otherwise opening a file rewrites it,
+      // and the watcher-reload that follows can blank the canvas).
+      if (Date.now() < suppressSaveUntil.current) return;
       // Coalesce rapid strokes, then push the current scene to the host.
       clearTimeout(sendTimer.current);
       sendTimer.current = setTimeout(send, 80);
