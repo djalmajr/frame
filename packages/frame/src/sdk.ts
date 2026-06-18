@@ -87,6 +87,14 @@ export class FrameSDK {
   // Flag to prevent processing multiple INIT messages
   #initialized = false;
 
+  // Memoized in-flight initialize() promise. Concurrent callers (e.g. an early
+  // top-level initialize() in the guest's entrypoint + the framework hook's own
+  // initialize()) must share ONE message listener + timeout. Otherwise a second
+  // initialize() would attach a second listener, and when the single INIT
+  // arrives the duplicate-INIT guard (#initialized) makes the second handler
+  // bail WITHOUT resolving — leaving that caller's promise forever pending.
+  #initPromise?: Promise<void>;
+
   /**
    * Check if the SDK has been initialized
    */
@@ -158,7 +166,13 @@ export class FrameSDK {
       return Promise.resolve();
     }
 
-    return new Promise((resolve, reject) => {
+    // Share one in-flight initialization across concurrent callers so they
+    // reuse a single message listener + timeout (see #initPromise).
+    if (this.#initPromise) {
+      return this.#initPromise;
+    }
+
+    this.#initPromise = new Promise((resolve, reject) => {
       let timeoutId: ReturnType<typeof setTimeout> | undefined;
       let messageHandler: ((event: MessageEvent) => void) | undefined;
 
@@ -245,6 +259,8 @@ export class FrameSDK {
 
       window.addEventListener("message", messageHandler, { once: true });
     });
+
+    return this.#initPromise;
   }
 
   /**
