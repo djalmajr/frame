@@ -258,6 +258,13 @@ export class FrameSDK {
       };
 
       window.addEventListener("message", messageHandler, { once: true });
+
+      // Anuncia prontidão ao host: ele (re)envia INIT em resposta. Torna o
+      // handshake robusto a children que registram este listener tarde
+      // (SSR/code-split) e perderiam o INIT disparado no 'load' do iframe.
+      if (window.parent && window.parent !== window) {
+        window.parent.postMessage({ type: MessageEvent.CHILD_HELLO }, "*");
+      }
     });
 
     return this.#initPromise;

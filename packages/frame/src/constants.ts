@@ -2,6 +2,8 @@ export const MessageEvent = {
   // Lifecycle
   INIT: "__INIT__",
   READY: "__READY__",
+  // Child anuncia prontidão para receber INIT (handshake robusto a child tardio)
+  CHILD_HELLO: "__CHILD_HELLO__",
 
   // Properties
   PROPS_UPDATE: "__PROPS_UPDATE__",

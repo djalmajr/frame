@@ -95,8 +95,8 @@ export class Frame extends HTMLElement {
   // Cache for dynamically created methods
   _dynamicMethods = new Map<string, Function>();
 
-  // Handler reference for cleanup
-  #portMessageHandler?: (event: MessageEvent) => void;
+  // Listener de CHILD_HELLO na window (handshake robusto); guardado p/ cleanup
+  #helloHandler?: (event: MessageEvent) => void;
 
   // Storage for dynamic properties
   _propValues = new Map<string, unknown>();
@@ -354,21 +354,31 @@ export class Frame extends HTMLElement {
    * 4. Send INIT message to child
    * 5. Setup attribute observer
    */
-  private async _initialize() {
-    const channel = this._setupIframeAndChannel();
-    await this._waitForIframeLoad();
-    const props = this._collectAllProps();
-    this._sendInitMessage(channel, props);
+  private _initialize(): void {
+    this._setupIframe();
+
+    // Handshake robusto: além de enviar INIT quando o iframe dispara 'load'
+    // (ótimo p/ children que registram cedo — SPAs client-side), reenviamos INIT
+    // sempre que o child anuncia prontidão via CHILD_HELLO. Isso cobre children
+    // que registram o listener tarde (SSR/code-split) e perderiam o INIT do 'load'.
+    this.#helloHandler = (event: MessageEvent) => {
+      if (event.source !== this.#iframe?.contentWindow) return;
+      if ((event.data as { type?: string } | null)?.type === MessageEvent.CHILD_HELLO) {
+        this._sendInit();
+      }
+    };
+    window.addEventListener("message", this.#helloHandler);
+
+    void this._waitForIframeLoad().then(
+      () => this._sendInit(),
+      () => undefined, // erro/timeout já logado e emitido em _waitForIframeLoad
+    );
+
     this._setupAttributeObserver();
   }
 
-  /**
-   * Create iframe element and setup MessageChannel for communication
-   *
-   * @returns MessageChannel for parent-child communication
-   */
-  private _setupIframeAndChannel(): MessageChannel {
-    // Create and configure iframe
+  /** Cria e anexa o iframe (sem o canal — o canal é criado a cada _sendInit). */
+  private _setupIframe(): void {
     this.#iframe = document.createElement("iframe");
 
     // Normalize URL construction to handle trailing slashes
@@ -382,25 +392,7 @@ export class Frame extends HTMLElement {
     this.#iframe.style.cssText = "border:none;display:block;height:100%;width:100%;";
     this.#iframe.setAttribute("sandbox", this.sandbox);
 
-    // Create MessageChannel for dedicated communication
-    const channel = new MessageChannel();
-    this.#port = channel.port1;
-
-    // Setup message handler on our port
-    this.#portMessageHandler = (event) => {
-      try {
-        this._handleMessageFromIframe(event.data);
-      } catch (error) {
-        logger.error("Error handling message from iframe:", error);
-        this._emit("error", { message: "Message handler error", error });
-      }
-    };
-    this.#port.onmessage = this.#portMessageHandler;
-
-    // Add iframe to DOM
     this.appendChild(this.#iframe);
-
-    return channel;
   }
 
   /**
@@ -481,15 +473,30 @@ export class Frame extends HTMLElement {
    * @param props - Props to serialize and send
    * @throws Error if contentWindow is not accessible
    */
-  private _sendInitMessage(channel: MessageChannel, props: Record<string, unknown>): void {
-    // Serialize props (including functions and transferables)
+  private _sendInit(): void {
+    // Só antes do ready; depois disso o canal adotado já está estabelecido.
+    if (this.#ready || !this.#iframe) return;
+    const contentWindow = this.#iframe.contentWindow;
+    if (!contentWindow) return;
+
+    const props = this._collectAllProps();
     const { serialized, transferables } = this.#manager.serialize(props);
 
-    // Send INIT message with port2 transfer
-    const contentWindow = this.#iframe.contentWindow;
-    if (!contentWindow) {
-      throw new Error("[z-frame] Iframe contentWindow is not accessible");
-    }
+    // Canal novo a cada envio (load + hello). O child processa apenas o 1º INIT
+    // que recebe e responde READY naquela porta; adotamos essa porta abaixo. As
+    // demais portas ficam ociosas e são coletadas.
+    const channel = new MessageChannel();
+    channel.port1.onmessage = (event) => {
+      try {
+        if ((event.data as { type?: string } | null)?.type === MessageEvent.READY && !this.#ready) {
+          this.#port = channel.port1;
+        }
+        this._handleMessageFromIframe(event.data);
+      } catch (error) {
+        logger.error("Error handling message from iframe:", error);
+        this._emit("error", { message: "Message handler error", error });
+      }
+    };
 
     contentWindow.postMessage(
       {
@@ -787,7 +794,10 @@ export class Frame extends HTMLElement {
       this.#port.onmessage = null;
       this.#port.close();
     }
-    this.#portMessageHandler = undefined;
+    if (this.#helloHandler) {
+      window.removeEventListener("message", this.#helloHandler);
+      this.#helloHandler = undefined;
+    }
 
     // Clean up remaining resources
     this.#manager?.cleanup();
@@ -911,15 +921,16 @@ const setupPrototypeProxy = () => {
 
       const instance = receiver as Frame;
 
-      // Allow observed attributes (handled by attributeChangedCallback)
-      // Use receiver (the actual instance) instead of target (prototype chain)
-      // to properly invoke the setter defined on Frame.prototype
+      // Observed attributes (src/pathname/sandbox) já têm setter na classe e nem
+      // chegam aqui. Props herdadas (className/title/… no Element.prototype) caem
+      // neste trap: delega em `target` (o protótipo real), NÃO em `receiver` (o
+      // proxy) — senão o [[Set]] reentra este mesmo trap e recursa infinitamente.
       if (
         Frame.observedAttributes.includes(prop) ||
         prop in HTMLElement.prototype ||
         prop in Frame.prototype
       ) {
-        return Reflect.set(receiver, prop, value, receiver);
+        return Reflect.set(target, prop, value, receiver);
       }
 
       // Dynamic property - create reactive getter/setter
