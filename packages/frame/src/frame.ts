@@ -304,6 +304,18 @@ export class Frame extends HTMLElement {
       }
     }
 
+    // pathname changed after init WITHOUT a connected child (no handshake):
+    // plain/legacy content can't react to PROPS_UPDATE, so navigate the iframe
+    // directly — parity with changing a raw <iframe src>. Children that
+    // completed the handshake keep client-side routing via PROPS_UPDATE below.
+    if (this.#iframe && name === "pathname" && !this.#ready) {
+      const src = this.src!;
+      const normalizedSrc = src.endsWith("/") ? src.slice(0, -1) : src;
+      logger.log("pathname changed without connected child - navigating iframe");
+      this.#iframe.src = normalizedSrc + this.pathname;
+      return;
+    }
+
     // Handle dynamic attribute changes after frame is ready
     // Send PROPS_UPDATE for attributes that should be synced to frameSDK.props
     if (this.#ready) {
