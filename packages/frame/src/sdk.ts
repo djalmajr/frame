@@ -217,6 +217,14 @@ export class FrameSDK {
           // Mark as initialized immediately to prevent race condition
           this.#initialized = true;
 
+          // INIT accepted: this listener's job is done. Removal happens here,
+          // not via { once: true } — `once` would drop the listener on the
+          // FIRST message of any kind (devtools, extensions, app traffic),
+          // killing the handshake before INIT ever arrives.
+          if (messageHandler) {
+            window.removeEventListener("message", messageHandler);
+          }
+
           const message = event.data as InitMessage;
           this.#parentOrigin = event.origin;
 
@@ -257,7 +265,7 @@ export class FrameSDK {
         }
       };
 
-      window.addEventListener("message", messageHandler, { once: true });
+      window.addEventListener("message", messageHandler);
 
       // Anuncia prontidão ao host: ele (re)envia INIT em resposta. Torna o
       // handshake robusto a children que registram este listener tarde
