@@ -275,6 +275,14 @@ export class FrameSDK {
       }
     });
 
+    // A failed attempt must not poison future ones: drop the memo on
+    // rejection so a caller can retry with a fresh listener + CHILD_HELLO
+    // (every failure path above already removed the old listener).
+    this.#initPromise = this.#initPromise.catch((error) => {
+      this.#initPromise = undefined;
+      throw error;
+    });
+
     return this.#initPromise;
   }
 
