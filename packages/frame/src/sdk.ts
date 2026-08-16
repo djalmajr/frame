@@ -175,9 +175,18 @@ export class FrameSDK {
     this.#initPromise = new Promise((resolve, reject) => {
       let timeoutId: ReturnType<typeof setTimeout> | undefined;
       let messageHandler: ((event: MessageEvent) => void) | undefined;
+      let helloTimer: ReturnType<typeof setInterval> | undefined;
+
+      const stopHello = () => {
+        if (helloTimer !== undefined) {
+          clearInterval(helloTimer);
+          helloTimer = undefined;
+        }
+      };
 
       // Setup timeout to prevent indefinite wait
       timeoutId = setTimeout(() => {
+        stopHello();
         if (messageHandler) {
           window.removeEventListener("message", messageHandler);
         }
@@ -190,6 +199,7 @@ export class FrameSDK {
 
       messageHandler = (event) => {
         if (event.data.type === MessageEvent.INIT) {
+          stopHello();
           // Clear timeout on successful INIT
           if (timeoutId !== undefined) {
             clearTimeout(timeoutId);
@@ -270,8 +280,15 @@ export class FrameSDK {
       // Anuncia prontidão ao host: ele (re)envia INIT em resposta. Torna o
       // handshake robusto a children que registram este listener tarde
       // (SSR/code-split) e perderiam o INIT disparado no 'load' do iframe.
+      // O anúncio se repete até o INIT chegar: um hello isolado se perde se
+      // o host ainda não montou o próprio listener — o ping periódico fecha
+      // a corrida nos dois sentidos, seja qual lado subir por último.
       if (window.parent && window.parent !== window) {
-        window.parent.postMessage({ type: MessageEvent.CHILD_HELLO }, "*");
+        const sayHello = () => {
+          window.parent.postMessage({ type: MessageEvent.CHILD_HELLO }, "*");
+        };
+        sayHello();
+        helloTimer = setInterval(sayHello, 700);
       }
     });
 
