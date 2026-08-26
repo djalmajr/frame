@@ -1,6 +1,6 @@
 {
 	"name": "@zomme/frame",
-	"version": "1.2.4",
+	"version": "1.2.5",
 	"description": "Web Component for embedding micro-frontends in isolated iframes with bidirectional PostMessage communication",
 	"license": "Apache-2.0",
 	"author": "Zomme",
