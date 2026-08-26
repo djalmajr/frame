@@ -62,7 +62,7 @@ export class Frame extends HTMLElement {
    * Observed attributes for Web Component lifecycle
    */
   static get observedAttributes() {
-    return ["pathname", "sandbox", "src"];
+    return ["allow", "pathname", "sandbox", "src"];
   }
 
   /**
@@ -73,6 +73,7 @@ export class Frame extends HTMLElement {
     string,
     (instance: Frame, val?: string | null) => unknown
   > = {
+    allow: (instance) => instance.allow,
     pathname: (instance) => instance.pathname,
     sandbox: (instance) => instance.sandbox,
     src: (_, val) => val,
@@ -81,7 +82,7 @@ export class Frame extends HTMLElement {
   /**
    * Attributes that require iframe recreate when changed
    */
-  private static readonly RECREATE_ATTRS = new Set(["src", "sandbox"]);
+  private static readonly RECREATE_ATTRS = new Set(["src", "sandbox", "allow"]);
 
   #iframe!: HTMLIFrameElement;
   #observer?: MutationObserver;
@@ -146,6 +147,30 @@ export class Frame extends HTMLElement {
       this.removeAttribute("pathname");
     } else {
       this.setAttribute("pathname", value);
+    }
+  }
+
+  /**
+   * Get the iframe's Permissions Policy allowlist (`allow` attribute)
+   *
+   * Empty by default: powerful features (camera, geolocation, microphone…)
+   * stay opt-in per embed. The policy is computed when the embedded document
+   * loads, so changing it after initialization recreates the iframe — same
+   * contract as `sandbox`.
+   */
+  get allow(): string {
+    return this.getAttribute("allow") || "";
+  }
+
+  /**
+   * Set the iframe's Permissions Policy allowlist (syncs to HTML attribute)
+   * Note: Changing allow after initialization will recreate the iframe (reload the frame app)
+   */
+  set allow(value: string | null) {
+    if (value === null) {
+      this.removeAttribute("allow");
+    } else {
+      this.setAttribute("allow", value);
     }
   }
 
@@ -288,10 +313,10 @@ export class Frame extends HTMLElement {
     // If src or sandbox changes after initialization, recreate iframe
     if (this.#iframe && Frame.RECREATE_ATTRS.has(name)) {
       // src: always has oldValue when iframe exists
-      // sandbox: may be first-time set (oldValue === null) or normal change
+      // sandbox/allow: may be first-time set (oldValue === null) or normal change
       const shouldRecreate =
         (name === "src" && oldValue !== null && oldValue !== newValue) ||
-        (name === "sandbox" &&
+        ((name === "sandbox" || name === "allow") &&
           ((oldValue !== null && oldValue !== newValue) ||
             (oldValue === null && newValue !== null)));
 
@@ -403,6 +428,7 @@ export class Frame extends HTMLElement {
 
     this.#iframe.style.cssText = "border:none;display:block;height:100%;width:100%;";
     this.#iframe.setAttribute("sandbox", this.sandbox);
+    if (this.allow) this.#iframe.setAttribute("allow", this.allow);
 
     this.appendChild(this.#iframe);
   }
@@ -454,6 +480,7 @@ export class Frame extends HTMLElement {
   private _collectAllProps(): Record<string, unknown> {
     // Start with all special props (use getters for normalization where needed)
     const props: Record<string, unknown> = {
+      allow: this.allow, // Getter - empty by default
       pathname: this.pathname, // Getter - normalized
       sandbox: this.sandbox, // Getter - has default value
       src: this.src, // Direct - always included for child context

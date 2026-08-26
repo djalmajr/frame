@@ -1,727 +1,377 @@
 import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
-import { MessageEvent } from "../src/constants";
-import { Frame } from "../src/frame";
+import type { Frame } from "../src/frame";
 import { FrameSDK } from "../src/sdk";
 
+const SRC = "http://localhost:3000";
+
+const tick = (ms = 0) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Real end-to-end handshake between the two halves of the library:
+ *
+ * 1. The parent's _sendInit() posts INIT through the (mocked) iframe
+ *    contentWindow, carrying port2 of a real MessageChannel.
+ * 2. The test forwards that INIT to the child window, exactly like the
+ *    browser would deliver it inside the iframe.
+ * 3. sdk.initialize() adopts the port and answers READY, which the parent
+ *    receives over the channel and becomes ready.
+ *
+ * From then on every message (events, props, RPC) flows over the real
+ * MessageChannel — nothing is short-circuited.
+ */
 describe("integration: Frame <-> FrameSDK", () => {
   let frame: Frame;
   let sdk: FrameSDK;
-  let parentMessages: any[];
-  let childMessages: any[];
+  let handshakePorts: MessagePort[];
 
-  beforeEach(() => {
-    parentMessages = [];
-    childMessages = [];
+  const handshake = async (setup?: (frame: Frame) => void) => {
+    frame = document.createElement("z-frame") as Frame;
+    frame.setAttribute("src", SRC);
 
-    // Setup Frame
-    frame = new Frame() as any;
-    frame.__ready = true;
-    frame.__origin = "http://localhost:3000";
+    // happy-dom probes `on<type>` on dispatchEvent (real browsers never
+    // consult arbitrary on* props); the prototype proxy would fabricate a
+    // rejecting RPC method for it. Predefine inert own props for the
+    // camelCase events these tests listen to.
+    (frame as any).onready = undefined;
+    (frame as any).onregister = undefined;
+    (frame as any).onunregister = undefined;
 
-    // Mock iframe that captures messages to child
-    frame.__iframe = {
+    setup?.(frame);
+
+    const posted: Array<{ message: any; origin: string; transfer: Transferable[] }> = [];
+    const iframe = {
       contentWindow: {
-        postMessage: (message: any, origin: string, transferables?: Transferable[]) => {
-          childMessages.push({ message, origin, transferables });
-          // Simulate child receiving message
-          if (sdk) {
-            (sdk as any).handleMessage({
-              origin: "http://localhost:4200",
-              data: message,
-            });
-          }
+        postMessage: (message: any, origin: string, transfer: Transferable[] = []) => {
+          posted.push({ message, origin, transfer });
         },
       },
+      remove: mock(() => {}),
+      src: "",
+      setAttribute: mock(() => {}),
+      style: { cssText: "" },
     };
+    frame.__origin = SRC;
+    frame.__iframe = iframe as any;
 
-    // Setup FrameSDK
-    sdk = new FrameSDK() as any;
-    (sdk as any).parentOrigin = "http://localhost:4200";
+    sdk = new FrameSDK();
+    const initPromise = sdk.initialize();
 
-    // Mock parent.postMessage that captures messages to parent
-    window.parent.postMessage = (message: any, origin: string, transferables?: Transferable[]) => {
-      parentMessages.push({ message, origin, transferables });
-      // Simulate parent receiving message
-      if (frame) {
-        (frame as any).handleMessageFromIframe(message);
-      }
-    };
+    (frame as any)._sendInit();
+    const init = posted[0];
+    const ports = init.transfer.filter(
+      (item: unknown): item is MessagePort => item instanceof MessagePort,
+    );
+    handshakePorts.push(...ports);
+
+    window.dispatchEvent(
+      new MessageEvent("message", { data: init.message, origin: SRC, ports } as any),
+    );
+
+    await initPromise; // SDK adopted the port and sent READY
+    await tick(); // READY delivery to the parent is a macrotask
+
+    return { iframe, posted };
+  };
+
+  beforeEach(() => {
+    handshakePorts = [];
   });
 
   afterEach(() => {
-    parentMessages = [];
-    childMessages = [];
+    sdk?.cleanup();
+    frame?.disconnectedCallback();
+    for (const port of handshakePorts) {
+      port.close();
+    }
   });
 
   describe("initialization flow", () => {
-    it("should complete initialization handshake", async () => {
-      // Parent sends INIT
-      const initPromise = sdk.initialize();
+    it("should complete the INIT/READY handshake", async () => {
+      await handshake();
 
-      setTimeout(() => {
-        (sdk as any).handleMessage({
-          origin: "http://localhost:4200",
-          data: {
-            type: MessageEvent.INIT,
-            payload: {
-              name: "test-app",
-              base: "/test-app",
-            },
-          },
-        });
-      }, 10);
-
-      await initPromise;
-
-      // Check child sent READY
-      const readyMessage = parentMessages.find((msg) => msg.message.type === MessageEvent.READY);
-      expect(readyMessage).toBeDefined();
-
-      // Check SDK has props
-      expect(sdk.props).toBeDefined();
-      expect(sdk.props.name).toBe("test-app");
+      expect(sdk.isInitialized).toBe(true);
+      expect(frame.isReady).toBe(true);
+      expect(sdk.__parentOrigin).toBe(SRC);
     });
 
-    it("should deserialize functions in initial props", async () => {
-      const testFn = () => "parent function";
-      const fnId = "test-fn-id";
-      (frame.__manager as any).__functionRegistry.set(fnId, testFn);
+    it("should deliver special props and custom attributes to the child", async () => {
+      await handshake((el) => {
+        el.setAttribute("api-url", "https://api.example.com");
+        el.setAttribute("pathname", "/home");
+      });
 
-      const initPromise = sdk.initialize();
+      expect(sdk.props.src).toBe(SRC);
+      expect(sdk.props.pathname).toBe("/home");
+      expect(sdk.props.sandbox).toBe(frame.sandbox);
+      expect(sdk.props["api-url"]).toBe("https://api.example.com");
+    });
 
-      setTimeout(() => {
-        (sdk as any).handleMessage({
-          origin: "http://localhost:4200",
-          data: {
-            type: MessageEvent.INIT,
-            payload: {
-              name: "test-app",
-              base: "/test-app",
-              onSuccess: {
-                __fn: fnId,
-                __meta: { name: "onSuccess" },
-              },
-            },
-          },
-        });
-      }, 10);
+    it("should deliver allow as empty string by default", async () => {
+      await handshake();
 
-      await initPromise;
+      expect(sdk.props.allow).toBe("");
+    });
 
-      expect(typeof sdk.props.onSuccess).toBe("function");
+    it("should deliver the configured allow value in the INIT props", async () => {
+      await handshake((el) => {
+        el.setAttribute("allow", "camera; microphone");
+      });
+
+      expect(sdk.props.allow).toBe("camera; microphone");
+    });
+
+    it("should make parent function props callable in the child", async () => {
+      const onSave = mock((data: { id: number }) => `saved-${data.id}`);
+      await handshake((el) => {
+        (el as any).onSave = onSave;
+      });
+
+      expect(typeof sdk.props.onSave).toBe("function");
+
+      const result = await (sdk.props.onSave as (data: unknown) => Promise<string>)({ id: 42 });
+
+      expect(onSave).toHaveBeenCalledWith({ id: 42 });
+      expect(result).toBe("saved-42");
     });
   });
 
   describe("bidirectional events", () => {
     beforeEach(async () => {
-      const initPromise = sdk.initialize();
-
-      setTimeout(() => {
-        (sdk as any).handleMessage({
-          origin: "http://localhost:4200",
-          data: {
-            type: MessageEvent.INIT,
-            payload: { name: "test", base: "/test" },
-          },
-        });
-      }, 10);
-
-      await initPromise;
-      parentMessages = [];
+      await handshake();
     });
 
-    it("should emit event from child to parent", () => {
+    it("should emit event from child to parent", async () => {
       const parentHandler = mock(() => {});
       frame.addEventListener("user-action", parentHandler);
 
       sdk.emit("user-action", { type: "click", id: 123 });
+      await tick();
 
       expect(parentHandler).toHaveBeenCalledTimes(1);
-      expect(parentHandler.mock.calls[0][0].detail).toEqual({
+      expect((parentHandler.mock.calls[0][0] as CustomEvent).detail).toEqual({
         type: "click",
         id: 123,
       });
     });
 
-    it("should handle property event handlers", () => {
-      const parentHandler = mock(() => {});
-      (frame as any).onuseraction = parentHandler;
-
-      sdk.emit("user-action", { type: "click" });
-
-      expect(parentHandler).toHaveBeenCalledTimes(1);
-    });
-
-    it("should normalize event names for properties", () => {
-      const parentHandler = mock(() => {});
-      (frame as any).onstatechange = parentHandler;
-
-      sdk.emit("state:change", { value: 1 });
-
-      expect(parentHandler).toHaveBeenCalledTimes(1);
-    });
-
-    it("should use exact name for addEventListener", () => {
+    it("should use the exact event name for addEventListener", async () => {
       const handler1 = mock(() => {});
       const handler2 = mock(() => {});
-
       frame.addEventListener("state:change", handler1);
       frame.addEventListener("state-change", handler2);
 
       sdk.emit("state:change", { value: 1 });
+      await tick();
 
       expect(handler1).toHaveBeenCalledTimes(1);
       expect(handler2).not.toHaveBeenCalled();
     });
-  });
 
-  describe("bidirectional function calls", () => {
-    beforeEach(async () => {
-      const initPromise = sdk.initialize();
+    it("should emit event from parent to child", async () => {
+      const childHandler = mock(() => {});
+      sdk.on("route-change", childHandler);
 
-      setTimeout(() => {
-        (sdk as any).handleMessage({
-          origin: "http://localhost:4200",
-          data: {
-            type: MessageEvent.INIT,
-            payload: { name: "test", base: "/test" },
-          },
-        });
-      }, 10);
+      frame.emit("route-change", { path: "/settings" });
+      await tick();
 
-      await initPromise;
-      childMessages = [];
-      parentMessages = [];
+      expect(childHandler).toHaveBeenCalledTimes(1);
+      expect(childHandler).toHaveBeenCalledWith({ path: "/settings" });
     });
 
-    it("should call parent function from child", async () => {
-      const parentFn = mock((data: any) => `Result: ${data.value}`);
-      const fnId = "parent-fn-id";
-      (frame.__manager as any).__functionRegistry.set(fnId, parentFn);
+    it("should deserialize functions sent in child event data", async () => {
+      const parentHandler = mock(() => {});
+      frame.addEventListener("custom-event-test", parentHandler);
 
-      // Deserialize function in child
-      const childProxy = (sdk as any).deserializeValue({
-        __fn: fnId,
-        __meta: { name: "parentFn" },
-      });
+      const action = mock(() => "test result");
+      sdk.emit("custom-event-test", { action, data: { id: 123 } });
+      await tick();
 
-      // Call from child
-      const promise = childProxy({ value: 42 });
+      expect(parentHandler).toHaveBeenCalledTimes(1);
+      const detail = (parentHandler.mock.calls[0][0] as CustomEvent).detail as any;
 
-      // Wait for async call to complete
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      // The function arrived as a callable proxy, not a serialized token
+      expect(typeof detail.action).toBe("function");
 
-      const result = await promise;
-
-      expect(parentFn).toHaveBeenCalledWith({ value: 42 });
-      expect(result).toBe("Result: 42");
-    });
-
-    it("should call child function from parent", async () => {
-      const childFn = mock((data: any) => `Child result: ${data.value}`);
-      const fnId = "child-fn-id";
-      (sdk as any).functionRegistry.set(fnId, childFn);
-
-      // Deserialize function in parent
-      const parentProxy = (frame as any).deserializeValue({
-        __fn: fnId,
-        __meta: { name: "childFn" },
-      });
-
-      // Call from parent
-      const promise = parentProxy({ value: 99 });
-
-      // Wait for async call to complete
-      await new Promise((resolve) => setTimeout(resolve, 50));
-
-      const result = await promise;
-
-      expect(childFn).toHaveBeenCalledWith({ value: 99 });
-      expect(result).toBe("Child result: 99");
-    });
-
-    it("should pass functions as parameters", async () => {
-      const parentCallback = mock((result: string) => `Processed: ${result}`);
-      const childFn = mock((callback: Function) => {
-        return callback("test data");
-      });
-
-      const childFnId = "child-fn-id";
-      (sdk as any).functionRegistry.set(childFnId, childFn);
-
-      // Parent has proxy to child function
-      const parentProxy = (frame as any).deserializeValue({
-        __fn: childFnId,
-      });
-
-      // Call with callback
-      const promise = parentProxy(parentCallback);
-
-      // Wait for async call
-      await new Promise((resolve) => setTimeout(resolve, 100));
-
-      const result = await promise;
-
-      expect(childFn).toHaveBeenCalled();
-      expect(parentCallback).toHaveBeenCalledWith("test data");
-      expect(result).toBe("Processed: test data");
+      const result = await detail.action();
+      expect(action).toHaveBeenCalledTimes(1);
+      expect(result).toBe("test result");
     });
   });
 
-  describe("transferable objects", () => {
+  describe("register() and dynamic RPC methods", () => {
     beforeEach(async () => {
-      const initPromise = sdk.initialize();
-
-      setTimeout(() => {
-        (sdk as any).handleMessage({
-          origin: "http://localhost:4200",
-          data: {
-            type: MessageEvent.INIT,
-            payload: { name: "test", base: "/test" },
-          },
-        });
-      }, 10);
-
-      await initPromise;
-      childMessages = [];
-      parentMessages = [];
+      await handshake();
     });
 
-    it("should transfer ArrayBuffer from parent to child", () => {
-      const buffer = new ArrayBuffer(1024);
+    it("should expose child functions as callable parent methods", async () => {
+      const refreshFn = mock(() => "refreshed");
+      const exportFn = mock(async (format: string) => `exported-${format}`);
 
-      // Parent sets property with buffer
-      (frame as any).imageData = buffer;
+      sdk.register({ refresh: refreshFn, export: exportFn });
+      await tick();
 
-      // Check message was sent with transferable
-      const message = childMessages[childMessages.length - 1];
-      expect(message.transferables).toContain(buffer);
+      expect(frame._registeredFunctions.has("refresh")).toBe(true);
+      expect(frame._registeredFunctions.has("export")).toBe(true);
+
+      const refreshResult = await (frame as any).refresh();
+      const exportResult = await (frame as any).export("csv");
+
+      expect(refreshFn).toHaveBeenCalledTimes(1);
+      expect(exportFn).toHaveBeenCalledWith("csv");
+      expect(refreshResult).toBe("refreshed");
+      expect(exportResult).toBe("exported-csv");
     });
 
-    it("should transfer ArrayBuffer in event data", () => {
-      const buffer = new ArrayBuffer(512);
+    it("should dispatch the register event with callable proxies", async () => {
+      const parentHandler = mock(() => {});
+      frame.addEventListener("register", parentHandler);
 
-      sdk.emit("data-ready", { buffer });
+      const ping = mock(() => "pong");
+      sdk.register("ping", ping);
+      await tick();
 
-      // Check message included transferable
-      const message = parentMessages[parentMessages.length - 1];
-      expect(message.transferables).toContain(buffer);
+      expect(parentHandler).toHaveBeenCalledTimes(1);
+      const detail = (parentHandler.mock.calls[0][0] as CustomEvent).detail as any;
+      expect(typeof detail.ping).toBe("function");
+
+      const result = await detail.ping();
+      expect(ping).toHaveBeenCalledTimes(1);
+      expect(result).toBe("pong");
     });
 
-    it("should transfer multiple buffers", () => {
-      const buffer1 = new ArrayBuffer(256);
-      const buffer2 = new ArrayBuffer(512);
+    it("should pass complex data through registered function calls", async () => {
+      const saveFn = mock((data: { id: number; name: string; items: string[] }) => ({
+        success: true,
+        savedId: data.id,
+      }));
 
-      sdk.emit("multi-buffer", {
-        buf1: buffer1,
-        buf2: buffer2,
+      sdk.register("save", saveFn);
+      await tick();
+
+      const result = await (frame as any).save({
+        id: 42,
+        name: "Test Item",
+        items: ["a", "b", "c"],
       });
 
-      const message = parentMessages[parentMessages.length - 1];
-      expect(message.transferables).toContain(buffer1);
-      expect(message.transferables).toContain(buffer2);
-      expect(message.transferables).toHaveLength(2);
+      expect(saveFn).toHaveBeenCalledWith({ id: 42, name: "Test Item", items: ["a", "b", "c"] });
+      expect(result).toEqual({ success: true, savedId: 42 });
+    });
+
+    it("should remove functions when the child unregisters", async () => {
+      const unregisterHandler = mock(() => {});
+      frame.addEventListener("unregister", unregisterHandler);
+
+      const unregister = sdk.register({
+        refresh: mock(() => {}),
+        export: mock(() => {}),
+      });
+      await tick();
+      expect(frame._registeredFunctions.has("refresh")).toBe(true);
+
+      unregister();
+      await tick();
+
+      expect(unregisterHandler).toHaveBeenCalledTimes(1);
+      expect(frame._registeredFunctions.has("refresh")).toBe(false);
+      expect(frame._registeredFunctions.has("export")).toBe(false);
+      await expect((frame as any).refresh()).rejects.toThrow("not registered");
+    });
+
+    it("should handle multiple register calls independently", async () => {
+      sdk.register(
+        "fn1",
+        mock(() => "one"),
+      );
+      await tick();
+      sdk.register(
+        "fn2",
+        mock(() => "two"),
+      );
+      await tick();
+
+      expect(await (frame as any).fn1()).toBe("one");
+      expect(await (frame as any).fn2()).toBe("two");
     });
   });
 
   describe("property updates", () => {
     beforeEach(async () => {
-      const initPromise = sdk.initialize();
-
-      setTimeout(() => {
-        (sdk as any).handleMessage({
-          origin: "http://localhost:4200",
-          data: {
-            type: MessageEvent.INIT,
-            payload: { name: "test", base: "/test", theme: "light" },
-          },
-        });
-      }, 10);
-
-      await initPromise;
-      childMessages = [];
-      parentMessages = [];
+      await handshake((el) => {
+        el.setAttribute("theme", "light");
+      });
     });
 
-    it("should update child props when parent changes attribute", () => {
+    it("should deliver initial attributes and live property updates", async () => {
       expect(sdk.props.theme).toBe("light");
 
-      (sdk as any).handleMessage({
-        origin: "http://localhost:4200",
-        data: {
-          type: MessageEvent.ATTRIBUTE_CHANGE,
-          attribute: "theme",
-          value: "dark",
-        },
-      });
+      (frame as any).theme = "dark";
+      await tick();
 
       expect(sdk.props.theme).toBe("dark");
     });
 
-    it("should trigger watch handlers on attribute change", () => {
+    it("should trigger child watch handlers with [new, old] tuples", async () => {
       const handler = mock(() => {});
       sdk.watch(["theme"], handler);
 
-      (sdk as any)._handleMessage({
-        origin: "http://localhost:4200",
-        data: {
-          type: MessageEvent.ATTRIBUTE_CHANGE,
-          attribute: "theme",
-          value: "dark",
-        },
-      });
+      (frame as any).theme = "dark";
+      await tick();
 
       expect(handler).toHaveBeenCalledTimes(1);
-      const changes = handler.mock.calls[0][0];
-      expect(changes.theme).toBeDefined();
-      expect(changes.theme[0]).toBe("dark");
+      expect((handler.mock.calls[0][0] as any).theme).toEqual(["dark", "light"]);
     });
 
-    it("should deserialize functions in attribute updates", () => {
-      const parentFn = () => "updated function";
-      const fnId = "new-fn-id";
-      (frame.__manager as any).__functionRegistry.set(fnId, parentFn);
+    it("should sync observed attribute changes (pathname) to child props", async () => {
+      frame.setAttribute("pathname", "/settings");
+      await tick();
 
-      (sdk as any).handleMessage({
-        origin: "http://localhost:4200",
-        data: {
-          type: MessageEvent.ATTRIBUTE_CHANGE,
-          attribute: "onUpdate",
-          value: {
-            __fn: fnId,
-            __meta: { name: "onUpdate" },
-          },
-        },
-      });
+      expect(sdk.props.pathname).toBe("/settings");
+    });
+
+    it("should deserialize function values in live prop updates", async () => {
+      const onUpdate = mock(() => "updated");
+      (frame as any).onUpdate = onUpdate;
+      await tick();
 
       expect(typeof sdk.props.onUpdate).toBe("function");
-    });
-  });
-
-  describe("cleanup and garbage collection", () => {
-    beforeEach(async () => {
-      const initPromise = sdk.initialize();
-
-      setTimeout(() => {
-        (sdk as any).handleMessage({
-          origin: "http://localhost:4200",
-          data: {
-            type: MessageEvent.INIT,
-            payload: { name: "test", base: "/test" },
-          },
-        });
-      }, 10);
-
-      await initPromise;
-    });
-
-    it("should release child functions when parent disconnects", () => {
-      const fnId = "test-fn-id";
-      (frame.__manager as any).__functionRegistry.set(fnId, () => {});
-      (frame.__manager as any).__trackedFunctions.add(fnId);
-
-      (sdk as any).functionRegistry.set(fnId, () => {});
-      (sdk as any).trackedFunctions.add(fnId);
-
-      frame.disconnectedCallback();
-
-      // Check parent sent release message
-      const releaseMessage = childMessages.find(
-        (msg) => msg.message.type === MessageEvent.FUNCTION_RELEASE && msg.message.fnId === fnId,
-      );
-      expect(releaseMessage).toBeDefined();
-
-      // Check parent cleaned up
-      expect((frame.__manager as any).__functionRegistry.has(fnId)).toBe(false);
-      expect((frame.__manager as any).__trackedFunctions.has(fnId)).toBe(false);
-    });
-
-    it("should handle function release from parent", () => {
-      const fnId = "test-fn-id";
-      (sdk as any).functionRegistry.set(fnId, () => {});
-      (sdk as any).trackedFunctions.add(fnId);
-
-      (sdk as any).handleMessage({
-        origin: "http://localhost:4200",
-        data: {
-          type: MessageEvent.FUNCTION_RELEASE,
-          fnId,
-        },
-      });
-
-      expect((sdk as any).functionRegistry.has(fnId)).toBe(false);
-      expect((sdk as any).trackedFunctions.has(fnId)).toBe(false);
+      const result = await (sdk.props.onUpdate as () => Promise<string>)();
+      expect(onUpdate).toHaveBeenCalledTimes(1);
+      expect(result).toBe("updated");
     });
   });
 
   describe("error handling", () => {
     beforeEach(async () => {
-      const initPromise = sdk.initialize();
-
-      setTimeout(() => {
-        (sdk as any).handleMessage({
-          origin: "http://localhost:4200",
-          data: {
-            type: MessageEvent.INIT,
-            payload: { name: "test", base: "/test" },
-          },
-        });
-      }, 10);
-
-      await initPromise;
-      childMessages = [];
-      parentMessages = [];
+      await handshake();
     });
 
-    it("should handle function call errors in parent", async () => {
-      const parentFn = mock(() => {
+    it("should propagate child function errors to the parent caller", async () => {
+      sdk.register(
+        "explode",
+        mock(() => {
+          throw new Error("Child error");
+        }),
+      );
+      await tick();
+
+      await expect((frame as any).explode()).rejects.toThrow("Child error");
+    });
+
+    it("should propagate parent function errors to the child caller", async () => {
+      const onFail = mock(() => {
         throw new Error("Parent error");
       });
-      const fnId = "parent-fn-id";
-      (frame.__manager as any).__functionRegistry.set(fnId, parentFn);
+      (frame as any).onFail = onFail;
+      await tick();
 
-      const childProxy = (sdk as any).deserializeValue({ __fn: fnId });
-
-      try {
-        await childProxy();
-        expect(true).toBe(false); // Should not reach here
-      } catch (error) {
-        expect((error as Error).message).toBe("Parent error");
-      }
+      await expect((sdk.props.onFail as () => Promise<unknown>)()).rejects.toThrow("Parent error");
     });
 
-    it("should handle function call errors in child", async () => {
-      const childFn = mock(() => {
-        throw new Error("Child error");
-      });
-      const fnId = "child-fn-id";
-      (sdk as any).functionRegistry.set(fnId, childFn);
-
-      const parentProxy = (frame as any).deserializeValue({ __fn: fnId });
-
-      try {
-        await parentProxy();
-        expect(true).toBe(false); // Should not reach here
-      } catch (error) {
-        expect((error as Error).message).toBe("Child error");
-      }
-    });
-
-    it("should handle missing function in parent", async () => {
-      const childProxy = (sdk as any).deserializeValue({
-        __fn: "non-existent-id",
-      });
-
-      try {
-        await childProxy();
-        expect(true).toBe(false); // Should not reach here
-      } catch (error) {
-        expect((error as Error).message).toContain("Function not found");
-      }
-    });
-  });
-
-  describe("register() method integration", () => {
-    beforeEach(async () => {
-      const initPromise = sdk.initialize();
-
-      setTimeout(() => {
-        (sdk as any).handleMessage({
-          origin: "http://localhost:4200",
-          data: {
-            type: MessageEvent.INIT,
-            payload: { name: "test", base: "/test" },
-          },
-        });
-      }, 10);
-
-      await initPromise;
-      childMessages = [];
-      parentMessages = [];
-    });
-
-    it("should register functions and parent should receive callable proxies", async () => {
-      // Setup parent listener for register event
-      const parentHandler = mock(() => {});
-      frame.addEventListener("register", parentHandler);
-
-      // Child registers functions
-      const refreshFn = mock(() => "refreshed");
-      const exportFn = mock(async (format: string) => `exported-${format}`);
-
-      sdk.register({
-        refresh: refreshFn,
-        export: exportFn,
-      });
-
-      // Wait for event to propagate
-      await new Promise((resolve) => setTimeout(resolve, 50));
-
-      // Verify parent received event
-      expect(parentHandler).toHaveBeenCalledTimes(1);
-      const eventData = parentHandler.mock.calls[0][0].detail;
-
-      // Verify functions are callable (not serialized tokens)
-      expect(typeof eventData.refresh).toBe("function");
-      expect(typeof eventData.export).toBe("function");
-
-      // Parent calls child functions
-      const refreshResult = eventData.refresh();
-      const exportResult = await eventData.export("csv");
-
-      // Wait for function calls to complete
-      await new Promise((resolve) => setTimeout(resolve, 50));
-
-      // Verify child functions were called
-      expect(refreshFn).toHaveBeenCalledTimes(1);
-      expect(exportFn).toHaveBeenCalledWith("csv");
-
-      // Verify results
-      expect(await refreshResult).toBe("refreshed");
-      expect(exportResult).toBe("exported-csv");
-    });
-
-    it("should deserialize functions in CUSTOM_EVENT (bug fix verification)", async () => {
-      const parentHandler = mock(() => {});
-      frame.addEventListener("custom-event-test", parentHandler);
-
-      const testFn = mock(() => "test result");
-      sdk.emit("custom-event-test", {
-        action: testFn,
-        data: { id: 123 },
-      });
-
-      // Wait for event to propagate
-      await new Promise((resolve) => setTimeout(resolve, 50));
-
-      expect(parentHandler).toHaveBeenCalledTimes(1);
-      const eventData = parentHandler.mock.calls[0][0].detail;
-
-      // CRITICAL: Verify function was deserialized, not just a serialized token
-      expect(typeof eventData.action).toBe("function");
-      expect(eventData.action).not.toHaveProperty("__fn");
-
-      // Verify function is callable
-      const result = await eventData.action();
-      await new Promise((resolve) => setTimeout(resolve, 50));
-
-      expect(testFn).toHaveBeenCalledTimes(1);
-      expect(await result).toBe("test result");
-    });
-
-    it("should handle unregister cleanup", async () => {
-      const parentHandler = mock(() => {});
-      frame.addEventListener("unregister", parentHandler);
-
-      // Register functions
-      const unregister = sdk.register({
-        refresh: mock(() => {}),
-        export: mock(() => {}),
-      });
-
-      // Clear messages
-      parentMessages = [];
-
-      // Call unregister
-      unregister();
-
-      // Wait for event to propagate
-      await new Promise((resolve) => setTimeout(resolve, 50));
-
-      // Verify unregister event was received
-      expect(parentHandler).toHaveBeenCalledTimes(1);
-      const eventData = parentHandler.mock.calls[0][0].detail;
-
-      expect(eventData.functions).toContain("refresh");
-      expect(eventData.functions).toContain("export");
-    });
-
-    it("should register single function with name", async () => {
-      const parentHandler = mock(() => {});
-      frame.addEventListener("register", parentHandler);
-
-      const pingFn = mock(() => "pong");
-      sdk.register("ping", pingFn);
-
-      // Wait for event to propagate
-      await new Promise((resolve) => setTimeout(resolve, 50));
-
-      expect(parentHandler).toHaveBeenCalledTimes(1);
-      const eventData = parentHandler.mock.calls[0][0].detail;
-
-      expect(typeof eventData.ping).toBe("function");
-
-      // Call function
-      const result = await eventData.ping();
-      await new Promise((resolve) => setTimeout(resolve, 50));
-
-      expect(pingFn).toHaveBeenCalledTimes(1);
-      expect(await result).toBe("pong");
-    });
-
-    it("should handle multiple register calls independently", async () => {
-      const parentHandler = mock(() => {});
-      frame.addEventListener("register", parentHandler);
-
-      // First register
-      sdk.register(
-        "fn1",
-        mock(() => {}),
+    it("should reject dynamic calls to functions never registered", async () => {
+      await expect((frame as any).ghostFunction()).rejects.toThrow(
+        "Function 'ghostFunction' not registered",
       );
-
-      await new Promise((resolve) => setTimeout(resolve, 50));
-
-      // Second register
-      sdk.register(
-        "fn2",
-        mock(() => {}),
-      );
-
-      await new Promise((resolve) => setTimeout(resolve, 50));
-
-      // Verify two separate events
-      expect(parentHandler).toHaveBeenCalledTimes(2);
-
-      const event1Data = parentHandler.mock.calls[0][0].detail;
-      const event2Data = parentHandler.mock.calls[1][0].detail;
-
-      expect(event1Data).toHaveProperty("fn1");
-      expect(event1Data).not.toHaveProperty("fn2");
-
-      expect(event2Data).toHaveProperty("fn2");
-      expect(event2Data).not.toHaveProperty("fn1");
-    });
-
-    it("should pass complex data in registered function calls", async () => {
-      const parentHandler = mock(() => {});
-      frame.addEventListener("register", parentHandler);
-
-      const saveFn = mock((data: { id: number; name: string; items: string[] }) => {
-        return { success: true, savedId: data.id };
-      });
-
-      sdk.register("save", saveFn);
-
-      await new Promise((resolve) => setTimeout(resolve, 50));
-
-      const eventData = parentHandler.mock.calls[0][0].detail;
-
-      // Parent calls with complex data
-      const result = await eventData.save({
-        id: 42,
-        name: "Test Item",
-        items: ["a", "b", "c"],
-      });
-
-      await new Promise((resolve) => setTimeout(resolve, 50));
-
-      expect(saveFn).toHaveBeenCalledWith({
-        id: 42,
-        name: "Test Item",
-        items: ["a", "b", "c"],
-      });
-
-      expect(await result).toEqual({ success: true, savedId: 42 });
     });
   });
 });

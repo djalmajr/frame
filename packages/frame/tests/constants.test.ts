@@ -1,15 +1,16 @@
 import { describe, expect, it } from "bun:test";
-import { MessageEvent } from "../src/constants";
+import { MessageEvent, VALID_MESSAGE_TYPES } from "../src/constants";
 
 describe("constants", () => {
   describe("MessageEvent", () => {
     it("should have lifecycle message types", () => {
       expect(MessageEvent.INIT).toBe("__INIT__");
       expect(MessageEvent.READY).toBe("__READY__");
+      expect(MessageEvent.CHILD_HELLO).toBe("__CHILD_HELLO__");
     });
 
     it("should have property message type", () => {
-      expect(MessageEvent.ATTRIBUTE_CHANGE).toBe("__ATTRIBUTE_CHANGE__");
+      expect(MessageEvent.PROPS_UPDATE).toBe("__PROPS_UPDATE__");
     });
 
     it("should have event message types", () => {
@@ -24,9 +25,9 @@ describe("constants", () => {
       expect(MessageEvent.FUNCTION_RELEASE_BATCH).toBe("__FUNCTION_RELEASE_BATCH__");
     });
 
-    it("should have exactly 9 message types", () => {
+    it("should have exactly 10 message types", () => {
       const keys = Object.keys(MessageEvent);
-      expect(keys).toHaveLength(9);
+      expect(keys).toHaveLength(10);
     });
 
     it("should have all message types prefixed with double underscore", () => {
@@ -34,6 +35,16 @@ describe("constants", () => {
       values.forEach((value) => {
         expect(value).toMatch(/^__[A-Z_]+__$/);
       });
+    });
+  });
+
+  describe("VALID_MESSAGE_TYPES", () => {
+    it("should contain every MessageEvent value", () => {
+      const values = Object.values(MessageEvent);
+      expect(VALID_MESSAGE_TYPES.size).toBe(values.length);
+      for (const value of values) {
+        expect(VALID_MESSAGE_TYPES.has(value)).toBe(true);
+      }
     });
   });
 });
